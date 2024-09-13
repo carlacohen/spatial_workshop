@@ -1,0 +1,579 @@
+---
+title: "Xenium workflow"
+output: html_document
+date: "2024-09-11"
+---
+
+Load packages
+```{r}
+library(Seurat)
+library(ggplot2)
+library(scCustomize)
+library(readr)
+library(pheatmap)
+library(matrixStats)
+library(spdep)
+library(geojsonR)
+```
+
+## Read data
+Load the data using ReadXenium (there are other platform-specific commands)
+NB file formats are continually updated so might not work!
+
+```{r}
+data_dir <- "/project/shared/spatial_data_camp/datasets/DATASET2/XENIUM_COLON_SUBSET"
+
+data <- ReadXenium(data_dir, 
+                   outs = c("matrix", # get the cellxgene matrix
+                            "microns"), # transcript coordinates
+                   type=c("centroids", # cell centroid coordinates
+                          "segmentations")) # cell segmentations
+names(data) # the components are saved as a list
+names(data$matrix) # the matrix has control components
+names(data$segmentations) #xy coordinates for each cell
+names(data$microns) # xy coordinates for each gene
+names(data$centroids) # xy coordinates for each cell centroid
+
+dim(data$segmentations) # there are multiple coordinates per cell
+dim(data$centroids) # one per cell
+```
+Read in additional information about the cells - this gives us pre-calculated information, for example segmented cell or nucleus size for each cell.
+```{r}
+cell_meta_data <- read.csv(file.path(data_dir, "cells.csv.gz"))
+rownames(cell_meta_data) <- cell_meta_data$cell_id
+head(cell_meta_data)
+```
+
+## Create a seurat object with the cellxgene matrix.
+Add the cell coordinates as metadata
+
+
+```{r}
+seurat <- CreateSeuratObject(counts = data$matrix[["Gene Expression"]],
+                                 assay = "XENIUM",
+                                 meta.data = cell_meta_data)
+seurat
+```
+## Add the spatial coordinates to the Seurat object 
+
+Creating the Field of View object can be problematic for large data sets and is optional. 
+
+But it lets you see the position of individual molecules. 
+
+In the SO the centroid info is required. The other parts of the image slot are optional and leaving them out can help improve performance. 
+
+
+```{r}
+# create a FOV object
+coords <- CreateFOV(coords = 
+                      list(centroids = CreateCentroids(data$centroids), 
+                           segmentation = CreateSegmentation(data$segmentations)),
+                    type = c("segmentation", "centroids"),
+                    molecules = data$microns, # skip for large dataset
+                    assay = "XENIUM")
+# add the FOV object to the SO as a new "spatial field of view"
+seurat[["COLON"]] <- coords # name carefully!
+seurat
+```
+
+## Add controls to the seurat object
+These are added as separate assays. 
+Still don't understand this very well. 
+Each one is a spare counts matrix of probe names vs cells. 
+
+
+```{r}
+seurat[["Negative.Control.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Codeword"]])
+seurat[["Negative.Control.Probe"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Probe"]])
+seurat[["Unassigned.Codeword"]] <- CreateAssayObject(counts = data$matrix[["Unassigned Codeword"]])
+
+seurat
+
+```
+## QC and visualisation
+
+Total transcripts detected per cell
+```{r}
+ImageFeaturePlot(seurat, "nCount_XENIUM") + scale_fill_viridis_c()
+```
+
+Total number of gene detected per cell
+
+```{r}
+ImageFeaturePlot(seurat, "nFeature_XENIUM") + scale_fill_viridis_c()
+```
+Distribution of the number of features (genes) detected per cell
+
+```{r}
+ggplot(seurat[[]], aes(nFeature_XENIUM)) + geom_density()
+quantile(seurat$nFeature_XENIUM, c(0.01, 0.1, 0.5, 0.9, 0.99))
+```
+
+## Cell size
+
+Visualise the cell area calculated by the cell segmentation algorithm. Here we can examine the spatial organization and potential heterogeneity of cell sizes within your tissue sample
+
+```{r}
+ImageFeaturePlot(seurat, "cell_area") + scale_fill_viridis_c()
+```
+
+Plot the cell-to-nucleus area ratio
+
+```{r}
+seurat$cell_nucleus_ratio <- seurat$nucleus_area / seurat$cell_area
+ImageFeaturePlot(seurat, "cell_nucleus_ratio") + scale_fill_viridis_c()
+```
+
+If we look at the distribution, we see that we have a big tail end of overly large cells.
+
+```{r}
+ggplot(seurat[[]], aes(cell_area)) + geom_density()
+```
+
+Plot cell area vs number of counts
+
+In this case, we can see that as expected, there is generally a correlation between cell area and transcript detection rate. 
+
+However, we also have a group of cells where this is not the case - very large cells but relatively few transcripts. These cells are mainly submucosal stromal cells which are very poorly covered by the panel 10x have used. 
+
+
+```{r}
+ggplot(seurat[[]], aes(nCount_XENIUM, cell_area)) + geom_point() 
+```
+
+We can create a filter to remove the overly large cells from the analysis.
+
+```{r}
+# calculate and add to metadata
+seurat[["SIZE_FILTER_LARGE"]] <- seurat$cell_area < quantile(seurat$cell_area, .99) #calc 99th centile for cell area (TRUE/FALSE)
+# visualise which cells would be removed 
+
+ImageDimPlot(seurat, group.by="SIZE_FILTER_LARGE")
+
+```
+Likewise create a filter for small cells
+
+```{r}
+seurat[["SIZE_FILTER_SMALL"]] <- seurat$cell_area > quantile(seurat$cell_area, .01)
+ImageDimPlot(seurat, group.by="SIZE_FILTER_SMALL")
+```
+
+Visualise the number of counts across small and large cells
+Shows that the smaller cells do indeed have fewer counts.
+These thresholds need to be set carefully, e.g. changing to 10% would lose too many small cells such as T cells.
+
+```{r fig.height=10, fig.width=7}
+p1 <- VlnPlot(seurat, "nFeature_XENIUM", group.by = "SIZE_FILTER_SMALL", pt.size = .1, alpha = .5) + labs(title="Small Cell Filter")
+p2 <- VlnPlot(seurat, "nFeature_XENIUM", group.by = "SIZE_FILTER_LARGE", pt.size = .1, alpha = .5)+ labs(title="Large Cell Filter")
+
+p1 + p2
+```
+
+## Filtering on transcript abundance
+
+Create a filter for <15 transcripts per cell and visualise which cells would be filtered. 
+
+```{r}
+seurat$TRANSCRIPT_FILTER <- seurat$nCount_XENIUM >= 15
+ImageDimPlot(seurat, group.by="TRANSCRIPT_FILTER")
+```
+We don't want to do this as we would filter out too many cells in packed areas like follicles. 
+
+## Visualise negative controls
+
+Here these have little signal so data is good quality. 
+
+```{r fig.height=7, fig.width=7}
+ImageFeaturePlot(seurat, "nCount_Negative.Control.Codeword") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat, "nCount_Negative.Control.Probe") + scale_fill_viridis_c()
+ImageFeaturePlot(seurat, "nCount_Unassigned.Codeword") + scale_fill_viridis_c()
+```
+
+Create a filter to remove cells that express negative controls (probably unncessary here)
+
+```{r}
+seurat$PROBE_FILTER <- seurat$nCount_Unassigned.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Codeword == 0 &
+                       seurat$nCount_Negative.Control.Probe == 0
+ImageDimPlot(seurat, group.by="PROBE_FILTER")
+```
+## Perform the filtering
+Base on any of the above criteria you think are important 
+Here we are using
+- probe filter (expression of negative controls)
+- size filters (large and small cells)
+- transcript filter (nCount > 15)
+
+```{r}
+seurat <- subset(seurat, PROBE_FILTER & SIZE_FILTER_LARGE & SIZE_FILTER_SMALL & TRANSCRIPT_FILTER)
+seurat
+```
+Now we have 541 genes and 29335 cells (previously had 32872 cells)
+
+## Normalisation & dim reduction
+
+Normalise with SCTransform & run PCA
+
+```{r}
+seurat <- SCTransform(seurat, assay = "XENIUM", clip.range = c(-10, 10))
+seurat <- RunPCA(seurat)
+```
+Elbow plot
+
+```{r}
+ElbowPlot(seurat, 50)
+```
+Explore the principle components
+
+```{r fig.height=9, fig.width=7}
+PC_Plotting(seurat, dim_number = 1)
+```
+
+Visualise a gene that is one of the top genes in PC1
+
+```{r}
+FeaturePlot(seurat, "CEACAM5", reduction = "pca") + scale_color_viridis_c()
+```
+
+Examine the PC loadings spatially. 
+Here, we can see that high PC1 loadings enrich in follicular structures and low PC1 loadings enrich in crypt top cells.
+```{r}
+ImageFeaturePlot(seurat, "PC_1") + scale_fill_viridis_c()
+```
+
+
+We can plot the expression of high (or low) loading genes to visualise how this correlates with our dimensionality reduction.
+```{r}
+ImageFeaturePlot(seurat, "MS4A1", size=.5) + scale_fill_viridis_c()
+```
+
+### Clustering
+
+Run UMAP, Find Neighbours on PCA space and then Find Clusters
+
+```{r}
+seurat <- RunUMAP(seurat, dims = 1:20)
+seurat <- FindNeighbors(seurat, reduction = "pca", dims = 1:20)
+seurat <- FindClusters(seurat, resolution = 0.7)
+```
+
+Visualise the clusters in UMAP space
+
+```{r}
+DimPlot(seurat, label=T, repel=T)
+```
+
+Visualise the clusters in tissue space
+
+```{r}
+ImageDimPlot(seurat, size=.5)
+```
+Find Markers for one cluster
+
+```{r}
+markers <- FindMarkers(seurat, ident.1="0", max.cells.per.ident=500)
+head(markers)
+```
+
+We can visualise expression of cluster specific markers using feature plots
+```{r}
+FeaturePlot(seurat, "CD3E", label=T, repel=T)+ scale_color_viridis_c(direction=-1)
+FeaturePlot(seurat, "MS4A1", label=T, repel=T)+  scale_color_viridis_c(direction=-1)
+FeaturePlot(seurat, "CEACAM5", label=T, repel=T)+ scale_color_viridis_c(direction=-1)
+FeaturePlot(seurat, "KIT", label=T, repel=T)+ scale_color_viridis_c(direction=-1)
+
+```
+
+Find all markers
+```{r}
+markers <- FindAllMarkers(seurat, max.cells.per.ident = 500)
+head(markers)
+```
+Extract top 5 markers per cluster
+```{r}
+top <- Extract_Top_Markers(markers, num_genes = 5, named_vector = FALSE, make_unique = TRUE)
+top
+```
+Visualise expression of these markers using dotplot 
+
+```{r fig.height=10, fig.width=7}
+Clustered_DotPlot(seurat, features = top, k=18)
+```
+## Visualisation
+
+Visualise all clusters
+
+```{r}
+ImageDimPlot(seurat)
+```
+
+Visualise your two favourite clusters
+
+```{r}
+ImageDimPlot(seurat, cells=WhichCells(seurat, expression = seurat_clusters %in% c(0, 5)))
+```
+Add the axes to the image plot. Then we can pick regions to zoom in. 
+
+```{r}
+ImageDimPlot(seurat, axes = T)
+```
+Crop the "COLON" assay and add as a new field of view 
+
+```{r}
+cropped <- Crop(seurat[["COLON"]], x = c(4200, 5000), y = c(8000, 8800), coords = "plot")
+seurat[["ROI1"]] <- cropped
+seurat
+```
+Now we can limit our visualisations just to this region by specifying the name of the new FOV as an "fov" arguement. 
+
+Also on the zoomed in version we can view the cell segmentations rather than centroids. 
+
+```{r fig.height=8, fig.width=8}
+ImageDimPlot(seurat, fov="ROI1", boundaries="segmentation", border.color = "black" )
+ImageDimPlot(seurat, fov="ROI1", size = 2)
+```
+Look at expression of a particular gene in this new FOV
+
+For example, here we have MS4A1/CD20 expression, which is a B-Cell marker. We can see it quite nicely limited to the lymphoid follicle. 
+```{r}
+ImageFeaturePlot(seurat, "MS4A1", fov="ROI1", boundaries="segmentation" , border.color = "black") + scale_fill_viridis_c()
+```
+Visualise some molecules. This helps show if the cell segmentation has worked. For example, here we can see there are a few molecules of CXCR5 detected outside of cellular boundaries. 
+
+```{r}
+ImageFeaturePlot(seurat, "MS4A1", fov="ROI1", boundaries="segmentation", molecules=c("CXCR5", "FOXP3"), mols.size = .5, border.color = "black" ) + scale_fill_viridis_c()
+```
+
+## Annotation by label transfer
+
+Load a single-cell reference dataset.  
+```{r}
+ref <- readRDS("/project/shared/spatial_data_camp/datasets/SINGLE_CELL_REFERENCES/COLON_HC_5K_CELLS.RDS")
+ref
+```
+Visualise pre-computed cell labels and clusters in the single cell object
+```{r}
+DimPlot(ref)
+```
+Visualise what happens in the single cell object if you use only the genes in the spatial dataset for SCT and downstream steps. 
+? why are we not re-clustering here?
+I guess because then we would have to re-annotate. We rather want to see how well the clusters are distinguished on the UMAP. 
+We can see that the stromal cells are not so well separated as before. 
+
+```{r}
+ref <- SCTransform(ref, residual.features =rownames(seurat))
+ref <- RunPCA(ref)
+ref <- RunUMAP(ref, dims=1:20)
+DimPlot(ref, label=T, repel=T)
+```
+Heatmap of gene panel expression across reference clusters
+We can see that some cell types are underrepresented in the gene panel. 
+This could be useful to do in the experimental design phase. 
+
+```{r}
+ps <- AggregateExpression(ref, features = rownames(seurat), normalization.method = "LogNormalize", assays="RNA", return.seurat = T)
+ps <- ScaleData(ps, features=rownames(ps))
+pheatmap(LayerData(ps, layer="scale.data"), show_rownames = F)
+```
+
+Transfer labels from the ref to the spatial data
+
+```{r}
+anchors <- FindTransferAnchors(reference = ref, 
+                               query = seurat, 
+                               normalization.method = "SCT")
+
+seurat <- TransferData(anchorset = anchors, 
+                       refdata = ref$CellType, 
+                       prediction.assay = TRUE,
+                       weight.reduction = seurat[["pca"]], 
+                       query = seurat, 
+                       dims=1:30)
+
+```
+Where has this info gone?
+Predicted.id and predicted.id.score columns added to metadata. 
+We can see that the stromal cell predictions are fuzzy and low confidence. 
+
+```{r}
+#seurat[[]]
+DimPlot(seurat, group.by= "predicted.id")
+FeaturePlot(seurat, features = "predicted.id.score")
+
+
+```
+View the predicted cell types on the tissue
+
+```{r}
+ImageDimPlot(seurat, group.by = "predicted.id")
+```
+
+It looks like some cells might be co-expresseing B and T cell markers due to poor cell segmentation. 
+
+View B and T cell markers together:
+
+```{r fig.height=5, fig.width=10}
+FeatureScatter(seurat, "MS4A1", "CD3D", jitter=T)
+FeaturePlot(seurat, c("MS4A1", "CD3D"))
+```
+
+## Improving cell segmentation
+
+We can use alternate methods to improve cell segmentation e.g. Baysor (see notes). 
+Read in the results of Baysor
+
+
+```{r}
+baysor <- "/project/shared/spatial_data_camp/datasets/PRECOMPUTED/baysor"
+```
+
+The key output of baysor is the file with transcripts, which have been re-assigned to a new cell identifier.
+```{r}
+seg <- read_csv(file.path(baysor, "segmentation.csv"))
+
+head(seg)
+```
+There will be some transcripts that cannot be assigned to a cell - about 10% in this case. This information is stored under "is_noise" flag. 
+This is fairly normal levels of noise.
+```{r}
+table(seg$is_noise)
+```
+
+baysor also calculates two confidence values - transcript assignment confidence represents the confidence that the transcript has been assigned to the correct cell.
+
+
+```{r}
+qplot(seg$assignment_confidence)
+table(seg$assignment_confidence > .9)
+```
+
+And transcript confidence - the confidence that the molecule itself is real and not noise.
+
+```{r}
+qplot(seg$confidence)
+table(seg$confidence > .9)
+```
+Filter out low confidence transcripts using the above two metrics. 
+Here, we will filter out transcripts that have not been assigned to cells, and below 0.9 confidence and assignment confidence.
+
+Then, we tabulate a cell by gene matrix from these data.
+
+```{r}
+filtered <- seg[seg$confidence > .9 & seg$assignment_confidence > .9 & !seg$is_noise, ]
+mat <- table(filtered$gene, filtered$cell)
+mat <- matrix(mat, ncol = ncol(mat), dimnames = dimnames(mat))
+mat[1:5, 1:5]
+```
+Read in additional file from Baysor with stats about the cell segmentation that can optionally be used for additional filtering. 
+
+```{r}
+# read in the stats
+stats <- read_csv(file.path(baysor, "segmentation_cell_stats.csv"))
+stats <- as.data.frame(stats)
+rownames(stats) <- stats$cell
+head(stats)
+```
+
+Create a Seurat object using the Baysor results
+
+```{r}
+seurat_reseg <- CreateSeuratObject(counts = mat, #baysor cellxgene matrix
+                                   assay = "XENIUM", 
+                                   meta.data = as.data.frame(stats)) #baysor stats
+seurat_reseg
+```
+Read in the baysor cell segmentation file
+NB 3D not 2D
+
+```{r}
+polygons <- FROM_GeoJson(file.path(baysor, "segmentation_polygons.json"))
+# this is a list
+```
+
+In the below code, we extract the polygon coordinates from the data and reformat them into a data frame that Seurat requires to construct a Segmentation object.
+
+```{r}
+polygons <- lapply(1:length(polygons$geometries), FUN=function(x){
+  df <- as.data.frame(polygons$geometries[[x]]$coordinates)
+  df$cell_id <- paste0("CRef9694c57-", x)
+  df
+  })
+
+polygons <- do.call(rbind, polygons)
+colnames(polygons) <- c("x", "y", "cell_id")
+polygons <- polygons[polygons$cell_id %in% Cells(seurat_reseg), ]
+polygons <- CreateSegmentation(polygons)
+```
+
+Then, as before, we add both the cell centroid and cell boundaries as segmentations to the seurat object. We skip adding individual molecule coordinates for now.
+```{r}
+cents <- CreateCentroids(stats[Cells(seurat_reseg), c("x", "y")])
+cents@cells <- Cells(seurat_reseg)
+coords <- CreateFOV(coords =list(centroids = cents, segmentation=polygons) ,
+                    type = c("centroids", "segmentation"), 
+                    molecules = NULL,
+                    assay = "XENIUM")
+
+seurat_reseg[["COLON"]] <- coords
+seurat_reseg
+```
+From here, we can use the seurat object to visualise various cell meta data - for example, average transcript assignment confidence per cell. 
+```{r}
+ImageFeaturePlot(seurat_reseg, "avg_assignment_confidence" ) + scale_fill_viridis_c()
+```
+Lets filter out low count cells and re-cluster the data as before
+
+```{r}
+seurat_reseg$FILT <- seurat_reseg$nCount_XENIUM >= 15
+seurat_reseg <- subset(seurat_reseg, FILT)
+seurat_reseg <- SCTransform(seurat_reseg, assay = "XENIUM", clip.range = c(-10, 10))
+seurat_reseg <- RunPCA(seurat_reseg)
+seurat_reseg <- RunUMAP(seurat_reseg, dims = 1:20)
+seurat_reseg <- FindNeighbors(seurat_reseg, reduction = "pca", dims = 1:20)
+seurat_reseg <- FindClusters(seurat_reseg, resolution = 0.3)
+seurat_reseg
+```
+
+Visualising clusters, we can see that we already obtain a better separation in the UMAP embedding than before. Though of course, distances in the UMAP space can be very misleading and careful interpretation is required. 
+```{r}
+DimPlot(seurat_reseg, label=T, repel = T)
+```
+Next we visualise the clusters in tissue space. 
+```{r}
+ImageDimPlot(seurat_reseg)
+```
+As before, lets cross-classify our cells using the reference single cell dataset
+```{r}
+anchors <- FindTransferAnchors(reference = ref, query = seurat_reseg, normalization.method = "SCT")
+
+seurat_reseg <- TransferData(anchorset = anchors, refdata = ref$CellType, prediction.assay = TRUE,
+    weight.reduction = seurat_reseg[["pca"]], query = seurat_reseg, dims=1:30)
+
+```
+
+Visualising the predictions, we've separated T-Cells from B-Cells much better.  The stromal clusters still predict poorly, but that is due to poor probe coverage. 
+```{r}
+DimPlot(seurat_reseg, group.by = "predicted.id")
+```
+We can check the distribution in tissue space:
+```{r}
+ImageDimPlot(seurat_reseg, group.by = "predicted.id")
+```
+```{r}
+FeaturePlot(seurat_reseg,"predicted.id.score")
+```
+Here we could look at the zoome in and visualise the new cell boundaries to see if we think it is better.  
+
+## Spatial neighbourhood analysis
+See the demo script. 
+
+```{r}
+Idents(seurat) <- seurat$predicted.id
+ImageDimPlot(seurat, fov = "ROI1", boundaries = "segmentation", border.color = "black")
+
+```
+
+
+ImageFeaturePlot(seurat, "MS4A1", 
+
+
