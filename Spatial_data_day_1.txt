@@ -1,0 +1,567 @@
+---
+title: "Spatial data camp day 1"
+output: html_notebook
+---
+
+Analysis of sequence based spatial data e.g. Visium/Visium HD
+
+Load packages
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(DropletUtils)
+library(SpotClean)
+library(SpatialExperiment)
+library(scCustomize)
+library(clustree)
+library(CARD)
+library(MuSiC)
+library(corrplot)
+```
+
+## Load data
+
+Load the raw gene x spot matrix. 
+This gives you a seurat object. 
+You can read in the filtered matrix but it is a good idea to look at the raw data to see what is going on over the whole slide. 
+
+NB the active assay is called Spatial.
+4992 spots
+32285 genes
+We are using seurat v5 here. 
+The object has an image slot (pixel array i.e colour intensity values of the image). Usually we read in a low res image which will load more quickly. 
+Boundaries - this is the centroid coordinate of the spot. (XY)
+Other slots e.g. PCA are similar to the usual seurat object. 
+
+You can add other images e.g. IF image, zoomed in field of view etc in the same way that you would add other assays. 
+
+In the solution script she has listed all the usual commands to access the various parts of the seurat object. 
+
+For Visium the Load10X_Spatial command usually works. For other technologies you might have to build the SO step wise. 
+
+*slice* Argument: This argument assigns a name or identifier to the tissue section being loaded.
+
+
+```{r Loading Data}
+visium_dir <- "/project/shared/spatial_data_camp/datasets/DATASET1/VISIUM_V1_MOUSE_INTESTINE/spaceranger/SRR14083626_HEALTHY_DAY0/outs"
+
+seurat <- Load10X_Spatial(data.dir=visium_dir, 
+                         filename = "raw_feature_bc_matrix.h5", 
+                         slice="mouse_intestine_section1",
+                         filter.matrix = FALSE)
+seurat
+```
+## READING IN AUTOMATED TISSUE DETECTION INFORMATION
+
+So you can look at whether the spot is under the tissue or not. 
+
+
+```{r Reading In Automated Tissue Detection Information}
+# this is a df of the tissue positions
+coords <- read.csv(file.path(visium_dir, "/spatial/tissue_positions.csv"))
+
+rownames(coords) <- coords$barcode
+
+coords$in_tissue # this column says whether the spot is under the tissue
+
+# add this info to the metadata of the so
+seurat$UnderTissue <- ifelse(coords[Cells(seurat), "in_tissue"], 
+                             yes="Under Tissue", 
+                             no="Outside Tisue")
+
+head(seurat[[]])
+```
+
+##VISUALISING THE SECTION
+
+Use the SpatialDimPlot function to visualise the spatial data.
+
+
+```{r}
+SpatialDimPlot(seurat) # not super informative!
+SpatialDimPlot(seurat, group.by = "UnderTissue") #seems to work well
+# change the colours
+SpatialDimPlot(seurat, group.by = "UnderTissue", 
+               cols = c("Under Tissue" = "blue", "Outside Tissue" = "grey"))
+```
+
+How many features and counts per spot?
+
+```{r Visualising Gene Detection Rate}
+SpatialFeaturePlot(seurat, "nFeature_Spatial") 
+SpatialFeaturePlot(seurat, "nCount_Spatial") 
+
+```
+
+## Calculate QC metrics
+
+% ribo and % mito are added to the metadata 
+
+```{r Calculating Addition QC Metrics}
+seurat <- PercentageFeatureSet(seurat, 
+                               pattern="^Rp", 
+                               col.name = "percent.rp")
+
+seurat <- PercentageFeatureSet(seurat, 
+                               pattern="^mt-", 
+                               col.name =  "percent.mt")
+
+# seurat[[]]
+```
+## Visualise QC metrics
+
+```{r Visualising Additional QC Metrics}
+SpatialFeaturePlot(seurat, "percent.rp") +
+SpatialFeaturePlot(seurat, "percent.mt")
+```
+
+
+## Calculate addiitonal QC metrics with scCustomize
+
+If you do this you don't actually need to calc the % ribo and % mt above. 
+
+```{r Calculating Commonly Used QC Metrics With scCustomize Wrapper}
+seurat <- Add_Cell_QC_Metrics(seurat_object = seurat,
+                              species = "mouse", 
+                              assay = "Spatial", 
+                              overwrite = TRUE,
+                              add_cell_cycle = FALSE)
+
+head(seurat)
+```
+
+Visualise counts that come from either ribo or mito
+
+```{r Visualising scCustomize Metrics 1}
+SpatialFeaturePlot(seurat, "percent_mito_ribo" )
+```
+Visualise the spot complexity
+
+```{r Visualising scCustomize Metrics 2}
+SpatialFeaturePlot(seurat, "log10GenesPerUMI" ) +
+QC_Histogram(seurat, features = "log10GenesPerUMI")
+```
+## Spot complexity
+
+The below code visualises an alternative complexity metric, indicating the percentage of total unique molecules occupied by the top 50 most highly expressed genes per spot in a spatial transcriptomics dataset.
+This metric can offer insights into the complexity and quality of each spot's transcriptome, particularly highlighting regions with very low diversity.
+A high percentage indicates that a small number of genes dominate the transcriptome in that spot, suggesting low complexity.
+Conversely, a lower percentage suggests a more diverse and complex transcriptome.
+
+As we would expect, the complexity of (most) spots outside the tissue covered area is very low and under tissue (mostly) high.
+
+We can use the values of QC metrics outside tissue as a guide to identify poor-quality spots under tissue.
+
+```{r Visualising scCustomize Metrics 3}
+SpatialFeaturePlot(seurat, "percent_top50" ) +
+QC_Histogram(seurat, features = "percent_top50")
+```
+
+Visualise the expression of genes according to various pathways (calculated above by scCustomise)
+
+
+```{r}
+SpatialFeaturePlot(seurat, "percent_oxphos" )
+SpatialFeaturePlot(seurat, "percent_apop" )
+SpatialFeaturePlot(seurat, "percent_dna_repair" )
+SpatialFeaturePlot(seurat, "percent_ieg" ) 
+```
+
+## Filtering
+
+Optimise filtering to remove poor quality spots. 
+First filter by nFeatures to 1500.
+NB this section visualises the potential filtering but doesn't actually filter anything. 
+We can see that it is not stringent enough. 
+
+```{r}
+# plot the proposed threshold
+QC_Histogram(seurat, "nFeature_Spatial", low_cutoff = 1500 )
+
+# add this threshold to the metadata
+seurat$SpotFilter <- seurat$nFeature_Spatial > 1500 
+
+# visualise which spots would be removed by the filter
+SpatialDimPlot(seurat, group.by = "SpotFilter")
+```
+
+## Plot the distribution of gene and molecule detection rate under and outside tissue covered areas.
+
+We can see there is a fair bit of overlap. 
+
+
+```{r}
+ggplot(seurat[[]], aes(nFeature_Spatial, colour=UnderTissue)) + geom_density()
+ggplot(seurat[[]], aes(nCount_Spatial, colour=UnderTissue)) + geom_density()
+```
+
+
+# SpotClean
+
+Optionally we can use SpotClean to clean up the diffused RNA (like ambient) that occurs between spots. 
+
+Takes ~20 min to run. 
+
+```{r}
+# create a SpatialExperiment object
+se <- read10xVisium(visium_dir, 
+      data="raw")
+# perform spotclean
+se <- spotclean(se, 
+                gene_keep = rownames(se), 
+                gene_cutoff = 0)
+
+# alternatively read this object in where the spotclean is pre computed
+#se <- readRDS("/project/shared/spatial_data_camp/datasets/PRECOMPUTED/spotclean.RDS")
+
+# access the new adjusted count matrix
+clean <- assays(se)[["decont"]]
+
+# change rownames to gene names in the matrix
+rownames(clean) <- rowData(se)$symbol 
+
+# put the adjusted matrix back into the seurat object as a new assay
+seurat[["SPOTCLEAN"]] <- CreateAssayObject(clean)
+seurat
+# this also adds nCount_SPOTCLEAN and nFeature_SPOTCLEAN to the metadata
+```
+Next, we visualise decontamination effects on total UMI or gene counts.
+Overall, it is not a big effect.
+
+```{r}
+p1 <- SpatialFeaturePlot(seurat, features = "nFeature_Spatial")
+p2 <- SpatialFeaturePlot(seurat, features = "nFeature_SPOTCLEAN")
+
+p1 + p2
+```
+
+
+## Normalise the data
+
+Normalise the origial data and the results of spot clean
+
+```{r}
+seurat <- NormalizeData(seurat, assay = "Spatial")
+seurat <- NormalizeData(seurat, assay="SPOTCLEAN")
+```
+Let's explore how to visualise the effects of SpotClean decontamination on the expression of individual genes, using the highly expressed gene Myh11 as an example.
+
+```{r}
+gene <- "Myh11"
+
+DefaultAssay(seurat) <- "Spatial"
+p1 <- SpatialFeaturePlot(seurat, features = gene)
+DefaultAssay(seurat) <- "SPOTCLEAN"
+p2 <- SpatialFeaturePlot(seurat, features = gene)
+
+p1 + p2
+```
+
+
+### Filtering
+
+Filter the data to include
+- only spots under the histology
+- spots with >1500 features 
+These were defined previously.
+```{r}
+seurat
+seurat <- subset(seurat, UnderTissue == "Under Tissue" & SpotFilter )
+seurat
+```
+Number of features did not change. 
+Went from 4992 to 2395 spots. 
+
+# Normalise with SCTransform
+
+
+
+```{r}
+seurat <- SCTransform(seurat, assay="SPOTCLEAN", return.only.var.genes = FALSE)
+```
+We can visualise both raw counts values and normalised values using Myh11 expression as an example:
+
+```{r}
+gene <- "Myh11"
+p1 <- SpatialFeaturePlot(seurat, gene, slot="data") # Normalised counts
+p2 <- SpatialFeaturePlot(seurat, gene, slot="counts") # Raw counts
+
+p1 + p2
+```
+
+Run PCA
+
+```{r}
+seurat <- RunPCA(seurat)
+```
+Elbow plot
+
+```{r}
+ElbowPlot(seurat, 50)
+```
+```{r fig.height=10, fig.width=7}
+PC_Plotting(seurat, dim_number = 1)
+PC_Plotting(seurat, dim_number = 10)
+PC_Plotting(seurat, dim_number = 30) # noise
+```
+
+View the PCs on the spatial data
+
+
+```{r}
+SpatialFeaturePlot(seurat, "PC_1", pt.size.factor = 2)
+SpatialFeaturePlot(seurat, "PC_10", pt.size.factor = 2)
+```
+
+Find Neighbours and Clusters, run UMAP
+NB here we are using all genes, we could subset to variable features or spatially variable features. 
+
+```{r}
+seurat <- FindNeighbors(seurat, dims = 1:12)
+seurat <- FindClusters(seurat, resolution = .5)
+seurat <- RunUMAP(seurat,  dims = 1:12)
+```
+
+Visualise the UMAP with clustering
+
+```{r}
+DimPlot(seurat, label=T, repel=T)
+```
+View the clusters on the spatial data
+
+
+```{r}
+SpatialDimPlot(seurat, pt.size.factor = 2)
+```
+Try some other clustering resolutions
+
+
+```{r}
+seurat <- FindClusters(seurat, resolution = .1)
+DimPlot(seurat, label=T, repel=T)
+SpatialDimPlot(seurat, pt.size.factor = 2)
+```
+
+```{r}
+seurat <- FindClusters(seurat, resolution = 1)
+DimPlot(seurat, label=T, repel=T)
+SpatialDimPlot(seurat, pt.size.factor = 2)
+```
+Do the clustree plot
+
+```{r fig.height=10, fig.width=7}
+clustree(seurat)
+clustree(seurat,  node_colour = "sc3_stability")
+```
+Find markers for cluster 1 at resolution = 1
+
+```{r}
+markers.cl1 <- FindMarkers(seurat, ident.1="1")
+head(markers.cl1)
+```
+
+Visualise the expression of one gene
+
+```{r}
+SpatialFeaturePlot(seurat, "Nr4a1")
+```
+
+```{r}
+VlnPlot(seurat, "Nr4a1")
+```
+
+```{r}
+FeaturePlot(seurat, "Nr4a1")
+```
+
+Find all markers
+
+```{r}
+markers <- FindAllMarkers(seurat)
+```
+
+Use the Extract_Top_Markers function from scCustomise to select the top markers for each cluster
+
+```{r}
+top <- Extract_Top_Markers(markers, num_genes = 5, named_vector = FALSE, make_unique = TRUE)
+top
+```
+
+Use scCustomise Clustered_DotPlot (could use seurat dotplot) to look at the expression of top markers
+*k = 8*: Determines the number of clusters for the hierarchical clustering of genes to enhance visual separation of expression patterns.
+
+```{r fig.height=10, fig.width=7}
+Clustered_DotPlot(seurat, features = top, k=8)
+```
+
+## Find spatially variable features
+
+The results of this function are normally saved in the meta.features slot of the object. 
+Here I am reading in the df that was previously calculated. 
+This can then be used in the downstream steps e.g. RunPCA etc. 
+
+```{r}
+seurat <- FindSpatiallyVariableFeatures(seurat, assay = "SCT", selection.method = "moransi") # ~ 20 mins running time
+#pre-computed table is available as an RDS file here:
+variablegenes <- readRDS("/project/shared/spatial_data_camp/datasets/PRECOMPUTED/sp.var.genes.RDS")
+variablegenes
+```
+
+**What do the most spatially variable genes look like?** **What about the least variable?**
+
+```{r}
+SpatialFeaturePlot(seurat, "mt-Co3")
+SpatialFeaturePlot(seurat, "Hmgcs2")
+```
+
+
+Repeat the clustering using spatially variable features
+
+
+```{r}
+seurat <- SCTransform(seurat, assay="Spatial", residual.features=rownames(variablegenes)[1:2000])
+seurat <- RunPCA(seurat)
+seurat <- RunUMAP(seurat, dims=1:12)
+seurat <- FindNeighbors(seurat, dims = 1:12)
+seurat <- FindClusters(seurat, resolution = .5)
+```
+
+Visualise the updated clustering solution.
+
+**How much does this approach change the previous clustering solution?**
+
+```{r}
+DimPlot(seurat, label=T, repel=T)
+SpatialDimPlot(seurat, pt.size.factor=2)
+```
+
+##CELL TYPE DECONVOLUTION
+
+Which cells are represented in each spot?
+
+As a reference, we will use a mouse intestine scRNA-Seq dataset.
+We can read in this data from a previously prepared Seurat object.
+
+```{r}
+ref <- readRDS("/project/shared/spatial_data_camp/datasets/SINGLE_CELL_REFERENCES/mouse_hc_colon_ref.RDS")
+DimPlot(ref, label=T, repel=T)
+```
+Set up the CARD object
+Question: Could we use the SPOTCLEAN assay instead of raw counts? Says raw in the help section. 
+
+```{r}
+card <-  createCARDObject(
+	sc_count = LayerData(ref, assay = "RNA", layer = "counts"), #scRNAseq count matrix
+	sc_meta = ref[[]], # scRNAseq metadata
+	spatial_count = LayerData(seurat, assay = "SCT", layer = "counts"), #spatial count matrix
+	spatial_location = GetTissueCoordinates(seurat), # get spatial coordinate data
+	ct.varname = "CellType", # which annotation column to use
+	ct.select = unique(ref$CellType), # which cell types to include
+	sample.varname = "Sample",
+	minCountGene = 100,
+	minCountSpot = 5) 
+```
+Run the deconvolution 
+Get a spot vs cell type matrix. 
+
+```{r}
+card <- CARD_deconvolution(CARD_object = card)
+```
+
+
+Visualise the deconvolution results with pie charts. 
+
+```{r fig.height=10, fig.width=10}
+CARD.visualize.pie(
+	proportion = card@Proportion_CARD,
+	spatial_location = card@spatial_location)
+```
+
+Put the deconvolution results back into the seurat object as a new assay
+
+```{r}
+seurat[["predictions"]] <- CreateAssayObject(t(card@Proportion_CARD))
+```
+We can then plot the deconvolution results for individual cell types using the same Seurat functions as before.
+
+```{r}
+DefaultAssay(seurat) <- "predictions"
+SpatialFeaturePlot(seurat, "Enterocytes", pt.size.factor = 2)
+SpatialFeaturePlot(seurat, "B-Cells", pt.size.factor = 2)
+SpatialFeaturePlot(seurat, "T-Cells", pt.size.factor = 2)
+SpatialFeaturePlot(seurat, "Myofibroblasts", pt.size.factor = 2)
+```
+
+```{r}
+FeaturePlot(seurat, "Enterocytes")
+FeaturePlot(seurat, "B-Cells")
+FeaturePlot(seurat, "T-Cells")
+FeaturePlot(seurat, "Myofibroblasts")
+```
+Could see how this compares to the clustering.
+
+```{r}
+DefaultAssay(seurat) <- "predictions"
+seurat <- ScaleData(seurat)
+DoHeatmap(seurat, features=rownames(seurat))
+```
+How well do the different cell types correlate?
+
+
+```{r}
+correlation <- cor(as.matrix(t(GetAssayData(seurat, assay="predictions"))))
+corrplot(correlation)
+```
+
+Find neighbours using the spatial location rather than the transcriptome. This allows us to explore the physical space. 
+
+```{r}
+# create a df of spot barcodes with xy coordinates
+coords <- GetTissueCoordinates(seurat, which = "centroids")
+# calculate neighbours based on coordinates
+neighbours <- FindNeighbors(as.matrix(coords[, c("x", "y")]), k.param = 20, return.neighbor=TRUE)
+
+```
+
+Find any spots that are adjacent to cluster 8, to see which cells might be interacting. 
+
+```{r}
+# collect the cells from cluster 8 
+cells <- WhichCells(seurat, expression= seurat_clusters == 8)
+# find the cells adjacent to cluster 8 using the nn calc above
+adjacent <- TopNeighbors(neighbours, cells, n = 6)
+
+# label these in the so and plot
+Idents(seurat) <- "Other Spots"
+seurat <- SetIdent(seurat, cells = adjacent, "Adjacent Spots")
+seurat <- SetIdent(seurat, cells = cells, "Spots of Interest")
+
+SpatialDimPlot(seurat, pt.size.factor = 2)
+```
+
+
+We can then use these groups to find specific gene expression patterns - e.g. finding the differences between the two adjacent layers.
+
+```{r}
+DefaultAssay(seurat) <- "SCT"
+diffs <- FindMarkers(seurat, "Adjacent Spots", "Spots of Interest")
+head(diffs, 10)
+```
+
+```{r}
+VlnPlot(seurat, "Saa1")
+```
+But we can also compare cell type deconvolution results in different layers.
+For example, we can see that the top layer of spots does not have a high Goblet cell signature, but the layer of spots we selected underneath does:
+
+```{r}
+VlnPlot(seurat, "Goblets")
+```
+
+You can save your seurat objects with all analyses as an RDS file to conveniently load it back up when needed or share with collaborators:
+
+```{r}
+saveRDS(seurat, file="mouse_intestine_visium.RDS")
+```
+
