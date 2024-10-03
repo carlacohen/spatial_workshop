@@ -1,0 +1,19 @@
+name: xenium-env
+
+channels:
+ - conda-forge
+ - bioconda
+ - defaults
+ - r
+
+dependencies:
+ - r-base
+ - r-tidyverse
+ - r-cowplot
+ - r-viridis
+ - r-seurat
+ - r-sp
+ - r-sccustomize
+ - r-pheatmap
+ - r-matrixstats
+ - r-clustree
